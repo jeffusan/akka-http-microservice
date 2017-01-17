@@ -12,12 +12,7 @@ import akka.stream.{ActorMaterializer, Materializer}
 import akka.stream.scaladsl.{Flow, Sink, Source}
 import com.typesafe.config.Config
 import com.typesafe.config.ConfigFactory
-import java.io.{IOException, InputStream}
-import java.security.{KeyStore, SecureRandom}
-import javax.net.ssl.{KeyManagerFactory, SSLContext, TrustManagerFactory}
-
-import com.typesafe.sslconfig.akka.AkkaSSLConfig
-
+import java.io.IOException
 import scala.concurrent.{ExecutionContextExecutor, Future}
 import scala.math._
 import spray.json.DefaultJsonProtocol
@@ -111,37 +106,11 @@ trait Service extends Protocols {
 
 object AkkaHttpMicroservice extends App with Service {
   override implicit val system = ActorSystem()
-  implicit val sslConfig = AkkaSSLConfig.get(system)
   override implicit val executor = system.dispatcher
   override implicit val materializer = ActorMaterializer()
 
   override val config = ConfigFactory.load()
   override val logger = Logging(system, getClass)
 
-  val password: Array[Char] = "password".toCharArray // do not store passwords in code, read them from somewhere safe!
-
-  val ks: KeyStore = KeyStore.getInstance("JKS")
-  val keystore: InputStream = getClass.getClassLoader.getResourceAsStream("twlserver.jks")
-
-  require(keystore != null, "Keystore required!")
-  ks.load(keystore, password)
-
-  val keyManagerFactory: KeyManagerFactory = KeyManagerFactory.getInstance("SunX509")
-  keyManagerFactory.init(ks, password)
-
-  val ts: KeyStore = KeyStore.getInstance("JKS")
-  val truststore: InputStream = getClass.getClassLoader.getResourceAsStream("truststore.jks")
-
-  require(ts != null, "Keystore required!")
-  ts.load(truststore, password)
-
-  val tmf: TrustManagerFactory = TrustManagerFactory.getInstance("SunX509")
-  tmf.init(ts)
-
-  val sslContext: SSLContext = SSLContext.getInstance("TLS")
-  sslContext.init(keyManagerFactory.getKeyManagers, tmf.getTrustManagers, new SecureRandom)
-  val https: HttpsConnectionContext = ConnectionContext.https(sslContext)
-
-  Http().setDefaultServerHttpContext(https)
   Http().bindAndHandle(routes, config.getString("http.interface"), config.getInt("http.port"))
 }
