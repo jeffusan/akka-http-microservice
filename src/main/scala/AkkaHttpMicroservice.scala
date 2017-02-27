@@ -1,58 +1,29 @@
 import akka.actor.ActorSystem
 import akka.event.{Logging, LoggingAdapter}
-import akka.http.scaladsl.{ConnectionContext, Http, HttpsConnectionContext}
-import akka.http.scaladsl.client.RequestBuilding
+import akka.http.scaladsl.{ConnectionContext, Http}
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import akka.http.scaladsl.marshalling.ToResponseMarshallable
-import akka.http.scaladsl.model.{HttpRequest, HttpResponse}
-import akka.http.scaladsl.model.StatusCodes._
+import akka.http.scaladsl.model.{HttpRequest, HttpResponse, HttpHeader}
 import akka.http.scaladsl.server.Directives._
-import akka.http.scaladsl.unmarshalling.Unmarshal
 import akka.stream.{ActorMaterializer, Materializer}
 import akka.stream.scaladsl.{Flow, Sink, Source}
 import com.typesafe.config.Config
 import com.typesafe.config.ConfigFactory
 import java.io.{IOException, InputStream}
-import java.security.{KeyStore, SecureRandom}
-import javax.net.ssl.{KeyManagerFactory, SSLContext, TrustManagerFactory}
-
-import com.typesafe.sslconfig.akka.AkkaSSLConfig
-
+import spray.json._
 import scala.concurrent.{ExecutionContextExecutor, Future}
-import scala.math._
 import spray.json.DefaultJsonProtocol
 
-case class IpInfo(query: String, country: Option[String], city: Option[String], lat: Option[Double], lon: Option[Double])
+case class ReceivedHeader(name: String, value: String)
 
-case class IpPairSummaryRequest(ip1: String, ip2: String)
+case class ReceivedParameter(name: String, value: String)
 
-case class IpPairSummary(distance: Option[Double], ip1Info: IpInfo, ip2Info: IpInfo)
-
-object IpPairSummary {
-  def apply(ip1Info: IpInfo, ip2Info: IpInfo): IpPairSummary = IpPairSummary(calculateDistance(ip1Info, ip2Info), ip1Info, ip2Info)
-
-  private def calculateDistance(ip1Info: IpInfo, ip2Info: IpInfo): Option[Double] = {
-    (ip1Info.lat, ip1Info.lon, ip2Info.lat, ip2Info.lon) match {
-      case (Some(lat1), Some(lon1), Some(lat2), Some(lon2)) =>
-        // see http://www.movable-type.co.uk/scripts/latlong.html
-        val φ1 = toRadians(lat1)
-        val φ2 = toRadians(lat2)
-        val Δφ = toRadians(lat2 - lat1)
-        val Δλ = toRadians(lon2 - lon1)
-        val a = pow(sin(Δφ / 2), 2) + cos(φ1) * cos(φ2) * pow(sin(Δλ / 2), 2)
-        val c = 2 * atan2(sqrt(a), sqrt(1 - a))
-        Option(EarthRadius * c)
-      case _ => None
-    }
-  }
-
-  private val EarthRadius = 6371.0
-}
+case class ResponseJson(method: String, headers: Seq[ReceivedHeader], params: Seq[ReceivedParameter])
 
 trait Protocols extends DefaultJsonProtocol {
-  implicit val ipInfoFormat = jsonFormat5(IpInfo.apply)
-  implicit val ipPairSummaryRequestFormat = jsonFormat2(IpPairSummaryRequest.apply)
-  implicit val ipPairSummaryFormat = jsonFormat3(IpPairSummary.apply)
+  implicit val headerFormat = jsonFormat2(ReceivedHeader.apply)
+  implicit val paramFormat = jsonFormat2(ReceivedParameter.apply)
+  implicit val responseJson = jsonFormat3(ResponseJson.apply)
 }
 
 trait Service extends Protocols {
@@ -63,85 +34,48 @@ trait Service extends Protocols {
   def config: Config
   val logger: LoggingAdapter
 
-  lazy val ipApiConnectionFlow: Flow[HttpRequest, HttpResponse, Any] =
-    Http().outgoingConnection(config.getString("services.ip-api.host"), config.getInt("services.ip-api.port"))
-
-  def ipApiRequest(request: HttpRequest): Future[HttpResponse] = Source.single(request).via(ipApiConnectionFlow).runWith(Sink.head)
-
-  def fetchIpInfo(ip: String): Future[Either[String, IpInfo]] = {
-    ipApiRequest(RequestBuilding.Get(s"/json/$ip")).flatMap { response =>
-      response.status match {
-        case OK => Unmarshal(response.entity).to[IpInfo].map(Right(_))
-        case BadRequest => Future.successful(Left(s"$ip: incorrect IP format"))
-        case _ => Unmarshal(response.entity).to[String].flatMap { entity =>
-          val error = s"FreeGeoIP request failed with status code ${response.status} and entity $entity"
-          logger.error(error)
-          Future.failed(new IOException(error))
-        }
-      }
-    }
+  def marshalResponse(method: String, parameters: Seq[(String, String)], headers: Seq[HttpHeader]): ToResponseMarshallable = {
+    val headrs = headers.map( h => ReceivedHeader(h.name(), h.value()))
+    val parms = parameters.map( p => ReceivedParameter(p._1, p._2))
+    ToResponseMarshallable(ResponseJson(method, headrs, parms).toJson)
   }
 
-  val routes = {
-    logRequestResult("akka-http-microservice") {
-      pathPrefix("ip") {
-        (get & path(Segment)) { ip =>
-          complete {
-            fetchIpInfo(ip).map[ToResponseMarshallable] {
-              case Right(ipInfo) => ipInfo
-              case Left(errorMessage) => BadRequest -> errorMessage
-            }
-          }
-        } ~
-        (post & entity(as[IpPairSummaryRequest])) { ipPairSummaryRequest =>
-          complete {
-            val ip1InfoFuture = fetchIpInfo(ipPairSummaryRequest.ip1)
-            val ip2InfoFuture = fetchIpInfo(ipPairSummaryRequest.ip2)
-            ip1InfoFuture.zip(ip2InfoFuture).map[ToResponseMarshallable] {
-              case (Right(info1), Right(info2)) => IpPairSummary(info1, info2)
-              case (Left(errorMessage), _) => BadRequest -> errorMessage
-              case (_, Left(errorMessage)) => BadRequest -> errorMessage
+  val routes =
+    pathPrefix("") {
+      logRequest("Received") {
+        parameterMap { pm =>
+          extractRequest { req =>
+            get {
+              complete(marshalResponse("get", pm.toSeq, req.headers))
+            } ~
+            post {
+              complete(marshalResponse("post", pm.toSeq, req.headers))
+            } ~
+            put {
+              complete(marshalResponse("put", pm.toSeq, req.headers))
+            } ~
+            delete {
+              complete(marshalResponse("delete", pm.toSeq, req.headers))
+            } ~
+            head {
+              complete(marshalResponse("head", pm.toSeq, req.headers))
+            } ~
+            options {
+              complete(marshalResponse("options", pm.toSeq, req.headers))
             }
           }
         }
       }
     }
-  }
 }
 
 object AkkaHttpMicroservice extends App with Service {
   override implicit val system = ActorSystem()
-  implicit val sslConfig = AkkaSSLConfig.get(system)
   override implicit val executor = system.dispatcher
   override implicit val materializer = ActorMaterializer()
 
   override val config = ConfigFactory.load()
   override val logger = Logging(system, getClass)
 
-  val password: Array[Char] = "password".toCharArray // do not store passwords in code, read them from somewhere safe!
-
-  val ks: KeyStore = KeyStore.getInstance("JKS")
-  val keystore: InputStream = getClass.getClassLoader.getResourceAsStream("twlserver.jks")
-
-  require(keystore != null, "Keystore required!")
-  ks.load(keystore, password)
-
-  val keyManagerFactory: KeyManagerFactory = KeyManagerFactory.getInstance("SunX509")
-  keyManagerFactory.init(ks, password)
-
-  val ts: KeyStore = KeyStore.getInstance("JKS")
-  val truststore: InputStream = getClass.getClassLoader.getResourceAsStream("truststore.jks")
-
-  require(ts != null, "Keystore required!")
-  ts.load(truststore, password)
-
-  val tmf: TrustManagerFactory = TrustManagerFactory.getInstance("SunX509")
-  tmf.init(ts)
-
-  val sslContext: SSLContext = SSLContext.getInstance("TLS")
-  sslContext.init(keyManagerFactory.getKeyManagers, tmf.getTrustManagers, new SecureRandom)
-  val https: HttpsConnectionContext = ConnectionContext.https(sslContext)
-
-  Http().setDefaultServerHttpContext(https)
   Http().bindAndHandle(routes, config.getString("http.interface"), config.getInt("http.port"))
 }
