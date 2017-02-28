@@ -18,12 +18,13 @@ case class ReceivedHeader(name: String, value: String)
 
 case class ReceivedParameter(name: String, value: String)
 
-case class ResponseJson(method: String, headers: Seq[ReceivedHeader], params: Seq[ReceivedParameter])
+case class ResponseJson(method: String, headers: Seq[ReceivedHeader], params: Seq[ReceivedParameter], content: String)
 
 trait Protocols extends DefaultJsonProtocol {
   implicit val headerFormat = jsonFormat2(ReceivedHeader.apply)
   implicit val paramFormat = jsonFormat2(ReceivedParameter.apply)
-  implicit val responseJson = jsonFormat3(ResponseJson.apply)
+  //implicit val responseJson = jsonFormat3(ResponseJson.apply)
+  implicit val rJ = jsonFormat4(ResponseJson.apply)
 }
 
 trait Service extends Protocols {
@@ -34,10 +35,14 @@ trait Service extends Protocols {
   def config: Config
   val logger: LoggingAdapter
 
-  def marshalResponse(method: String, parameters: Seq[(String, String)], headers: Seq[HttpHeader]): ToResponseMarshallable = {
+  def marshalResponse(method: String, parameters: Seq[(String, String)], headers: Seq[HttpHeader], content: String): ToResponseMarshallable = {
     val headrs = headers.map( h => ReceivedHeader(h.name(), h.value()))
     val parms = parameters.map( p => ReceivedParameter(p._1, p._2))
-    ToResponseMarshallable(ResponseJson(method, headrs, parms).toJson)
+    ToResponseMarshallable(ResponseJson(method, headrs, parms, content).toJson)
+  }
+
+  def getContent(req: HttpRequest): String = {
+    req.toString
   }
 
   val routes =
@@ -46,22 +51,22 @@ trait Service extends Protocols {
         parameterMap { pm =>
           extractRequest { req =>
             get {
-              complete(marshalResponse("get", pm.toSeq, req.headers))
+              complete(marshalResponse("get", pm.toSeq, req.headers, getContent(req)))
             } ~
             post {
-              complete(marshalResponse("post", pm.toSeq, req.headers))
+              complete(marshalResponse("post", pm.toSeq, req.headers, getContent(req)))
             } ~
             put {
-              complete(marshalResponse("put", pm.toSeq, req.headers))
+              complete(marshalResponse("put", pm.toSeq, req.headers, getContent(req)))
             } ~
             delete {
-              complete(marshalResponse("delete", pm.toSeq, req.headers))
+              complete(marshalResponse("delete", pm.toSeq, req.headers, getContent(req)))
             } ~
             head {
-              complete(marshalResponse("head", pm.toSeq, req.headers))
+              complete(marshalResponse("head", pm.toSeq, req.headers, getContent(req)))
             } ~
             options {
-              complete(marshalResponse("options", pm.toSeq, req.headers))
+              complete(marshalResponse("options", pm.toSeq, req.headers, getContent(req)))
             }
           }
         }
